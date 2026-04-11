@@ -73,7 +73,8 @@ Using the mean instead of a single pair makes the gesture robust to three or mor
 
 #### Decision rule
 
-Let $\bar{D}_t$ be the mean distance at frame $t$ and $\bar{D}_{t-1}$ the previous frame. The signed delta is:
+Let **D̄_t** be the mean distance at frame *t* and **D̄_(t−1)** the previous frame.
+The signed delta is:
 
 $$\Delta D = \bar{D}_t - \bar{D}_{t-1}$$
 
