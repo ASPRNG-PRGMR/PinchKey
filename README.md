@@ -73,8 +73,7 @@ Using the mean instead of a single pair makes the gesture robust to three or mor
 
 #### Decision rule
 
-Let **D̄_t** be the mean distance at frame *t* and **D̄_(t−1)** the previous frame.
-The signed delta is:
+Let $\bar{D}\_t$ be the mean distance at frame $t$ and $\bar{D}\_{t-1}$ the previous frame. The signed delta is:
 
 $$\Delta D = \bar{D}_t - \bar{D}_{t-1}$$
 
@@ -150,7 +149,9 @@ Additional items:
 - **Systemd unit** — run PinchKey as a user service (`~/.config/systemd/user/pinchkey.service`) so it starts automatically on login without requiring `sudo`.
 - **Velocity scaling** — scale the injected pinch magnitude proportionally to $|\Delta D|$ rather than firing a fixed-size gesture, giving a more natural feel. The scaling factor $\alpha$ would be:
 
-$$\text{PINCH\_TRAVEL\_FRAC}_{\text{effective}} = \alpha \cdot \frac{|\Delta D|}{W_x}$$
+$$
+{\text{PINCH\\_TRAVEL\\_FRAC}}_{\text{eff}} = \alpha \cdot \frac{\lvert \Delta D \rvert}{W_x}
+$$
 
 where $W_x = x_{\max} - x_{\min}$ is the full pad X-range.
 
