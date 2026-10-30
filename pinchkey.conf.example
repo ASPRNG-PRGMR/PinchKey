@@ -1,0 +1,68 @@
+# PinchKey configuration.
+#
+# Copy to ~/.config/pinchkey/pinchkey.conf (or /etc/pinchkey.conf) and edit.
+# Every value below is the built-in default, so an empty file behaves the same
+# as no file at all.
+#
+# Syntax: key = value, one per line. '#' starts a comment.
+
+# ── Trigger ──────────────────────────────────────────────────────────────────
+# alt_wheel  : hold Alt and turn the wheel
+# side_wheel : hold a mouse side button (BTN_SIDE/BTN_EXTRA) and turn the wheel
+trigger = alt_wheel
+
+# Scale factor per wheel notch. 1.08 is +8% per notch.
+# Raise for coarser, faster zoom; lower for finer control.
+zoom_step = 1.08
+
+# ── Gesture feel ─────────────────────────────────────────────────────────────
+# Frame interval of the synthetic gesture, in ms. 8 ~= 125Hz, which is roughly
+# the report rate of a real I2C touchpad.
+tick_ms = 8
+
+# Smoothing applied per tick toward the target scale, in (0, 1].
+# 1.0 snaps instantly and feels jerky; 0.25 is a smooth ~4-tick glide.
+ease = 0.25
+
+# Where the two virtual fingers start, as a half-gap in mm. Chosen per
+# direction so each gesture gets the most travel where it is needed: zooming
+# in starts with the fingers close, zooming out starts them wide.
+#
+# These set the per-gesture zoom ceiling. On a 121mm-wide pad with a 5mm edge
+# margin the fingers can reach a 55.5mm half-gap, so start_half_mm_in = 15
+# allows about 3.7x in one gesture. Releasing Alt lifts the fingers, and the
+# next scroll starts a fresh gesture — page scale accumulates across gestures,
+# so this is a per-gesture limit, not a total one.
+start_half_mm_in  = 15.0
+start_half_mm_out = 50.0
+
+# Keep-out band at the pad edge, so fingers never pin to the boundary.
+edge_margin_mm = 5.0
+
+# Smallest half-gap, so the two fingers never merge into one contact.
+min_half_mm = 4.0
+
+# Lift the fingers after this long with no input. Normally the modifier
+# release ends the gesture; this is the backstop for a stuck modifier.
+idle_lift_ms = 400
+
+# ── Devices ──────────────────────────────────────────────────────────────────
+# Grabbing hides a device from the compositor so we can swallow the trigger.
+# The mouse must be grabbed, or you would zoom and scroll at the same time.
+grab_mouse = true
+
+# Grabbing keyboards only serves to hide the bare Alt press from the
+# compositor. That is cosmetic (a held Alt does nothing in GNOME on its own)
+# and it would put PinchKey in the path of all your typing, plus one mirror
+# device per keyboard. Left false, keyboards are read passively purely to
+# track whether Alt is held — Alt+wheel still works.
+grab_keyboard = false
+
+# Log real touchpad slot positions and inter-finger distances. Diagnostic
+# only, and read-only: the pad is never grabbed, so native trackpad gestures
+# keep working. Your trackpad already pinches natively; this is for inspecting
+# the raw stream, not for driving zoom.
+monitor_touchpad = false
+
+# error | warn | info | debug
+log_level = info

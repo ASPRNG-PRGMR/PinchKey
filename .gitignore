@@ -1,1 +1,6 @@
-exec_PinchKey
+build/
+pinchkey
+pinchprobe
+
+# Local config, not the committed example
+pinchkey.conf
