@@ -1,236 +1,273 @@
 # PinchKey
 
-A four-phase project to bring native pinch-to-zoom to **Fedora Workstation** using the built-in trackpad — no GNOME Magnifier, no `Ctrl+scroll`, pure touchpad gesture injection via `libevdev` + `uinput`.
+Drive a browser's **native pinch-zoom from a mouse** on Linux.
+
+Hold `Alt` and turn the wheel. PinchKey synthesises a continuous two-finger
+pinch on a virtual touchpad; libinput recognises it, the compositor forwards it
+as a pointer-gesture pinch, and Chrome/Brave applies its own page-scale zoom
+**anchored at the mouse cursor** — exactly as if you had pinched a trackpad.
 
 ---
 
-## Project Phases
+## What this is, and what it is not
 
-Each phase incrementally builds on the previous one.
+This matters, because the three things below look similar and behave nothing
+alike.
 
-```
-Input Events → Phase 1 (Tracking) → Phase 2 (Distance) → Phase 3 (Gesture Engine) → uinput Injection
-```
+| | Anchored at | Reflows layout | Scope |
+|---|---|---|---|
+| **Pinch zoom** (what PinchKey drives) | mouse cursor | no | per page |
+| `Ctrl` + scroll (browser zoom) | viewport | **yes** | per site |
+| GNOME Magnifier | screen | no | whole desktop |
 
-All processing is frame-synchronous with `SYN_REPORT`, ensuring minimal latency.
+PinchKey is **not** a macOS-style system-wide zoom, and not a screen
+magnifier. It produces the first row: the browser's own visual page-scale
+zoom, centred on wherever your pointer is. Nothing is magnified outside the
+application that receives the gesture.
 
----
+Why it lands on the cursor: Wayland delivers a pinch through
+`zwp_pointer_gestures_v1` as `begin` / `update` / `end`, and an update carries
+**only a scale factor — no coordinates**. Blink applies the delta of that
+scale to the current page scale (`Viewport::PinchUpdate`) using the pointer
+location as the anchor. Since your mouse drives the pointer, the zoom centres
+itself for free.
 
-### Phase 1 — Detect finger positions on the trackpad
+## Why mouse, not trackpad
 
-The trackpad speaks **MT Protocol B** (`libevdev`). Each finger occupies a numbered *slot*; the driver emits `ABS_MT_POSITION_X` / `ABS_MT_POSITION_Y` per slot on every frame, then closes the frame with `SYN_REPORT`.
+If you have a trackpad, **it already does this** — libinput detects the pinch
+and the compositor forwards it with no help from anyone. Injecting a synthetic
+pinch in response to a real one would just double-apply the zoom.
 
-`scanAndAttach()` probes every `/dev/input/event*` node at startup, classifies each device (touchpad vs keyboard/mouse vs ignore), and spawns a dedicated `pthread` per device. The touchpad thread updates a `TouchpadState` struct holding the latest $(x, y)$ for each active slot.
-
-**Sample output**
-```
-[13938500ms][event10] SYNC  active=1  [0](26,0)
-[13938635ms][event10] SYNC  active=2  [0](26,0) [1](480,276)
-[13938642ms][event10] SYNC  active=3  [0](26,0) [1](480,276) [2](900,518)
-```
-
-On the test hardware the top-left corner of the pad maps to $(26,\;0)$ and the bottom-right to approximately $(1190,\;676)$ in raw kernel units.
-
----
-
-### Phase 2 — Compute distances between adjacent fingers
-
-Raw positions are no longer printed. Instead, on every `SYN_REPORT` the code:
-
-1. Collects all active finger coordinates.
-2. Sorts them **left-to-right** by the $x$ coordinate.
-3. Computes the **Euclidean distance** between each adjacent pair.
-
-For $N$ active fingers sorted as $f_0, f_1, \ldots, f_{N-1}$ (by $x$):
-
-$$d_i = \sqrt{(x_{i+1} - x_i)^2 + (y_{i+1} - y_i)^2}, \qquad i = 0,\,1,\,\ldots,\,N-2$$
-
-With two fingers this yields one distance; with three fingers, two distances (left↔middle, middle↔right).
-
-**Sample output**
-```
-[13939018ms][event10] SYNC  active=2  dist[0->1]=342.1
-[13939032ms][event10] SYNC  active=3  dist[0->1]=289.6  dist[1->2]=301.2
-```
-
-A spreading gesture produces an increasing $d_0$; a closing gesture produces a decreasing one.
+So PinchKey's job is to give a *mouse* the gesture a trackpad already has.
+The real touchpad is used for one thing only: as a **geometry template** for
+the virtual pad (see below). Reading the pad for diagnostics is available via
+`--monitor-touchpad`, and is strictly read-only — the pad is never grabbed, so
+native gestures keep working.
 
 ---
 
-### Phase 3 — Gesture recognition from live distance stream *(current phase)*
-
-This is the active development branch (`PinchKey_phase3.cpp`).
-
-The `GestureEngine` converts the Phase 2 distance stream into `emitPinch()` calls. Behavior is controlled via tunable thresholds (see [Tuning parameters](#tuning-parameters) below).
-
-#### Mean distance
-
-With $N-1$ adjacent pairs the engine tracks the **arithmetic mean**:
-
-$$\bar{D} = \frac{1}{N-1}\sum_{i=0}^{N-2} d_i$$
-
-Using the mean instead of a single pair makes the gesture robust to three or more fingers and to minor slot re-ordering.
-
-#### Decision rule
-
-Let $\bar{D}\_t$ be the mean distance at frame $t$ and $\bar{D}\_{t-1}$ the previous frame. The signed delta is:
-
-$$\Delta D = \bar{D}_t - \bar{D}_{t-1}$$
-
-A pinch is fired when **both** conditions hold:
-
-$$|\Delta D| > \tau \quad \text{and} \quad t - t_{\text{last}} > C$$
-
-where $\tau = 30$ raw units/frame (`PINCH_DIST_THRESHOLD`) and $C = 350\,\text{ms}$ (`PINCH_COOLDOWN_MS`).
-
-| Condition | Direction | Action |
-|---|---|---|
-| $\Delta D > +\tau$ | fingers spreading | `emitPinch(+1)` — zoom in |
-| $\Delta D < -\tau$ | fingers converging | `emitPinch(-1)` — zoom out |
-
-#### State machine
+## How it works
 
 ```
-IDLE  (< 2 fingers)
-  ↓  second finger touches down
-ACTIVE
-  frame 0  →  record D_prev, no action
-  frame k  →  compute ΔD
-               |ΔD| > τ AND cooldown OK  →  fire, reset cooldown timer
-               always update D_prev ← D_now
-  ↓  finger count drops below 2
-IDLE  (D_prev reset to −1)
+mouse wheel ──► [grabbed + mirrored] ──► trigger held?
+                        │                     │ no → replayed as a normal scroll
+                        │                     │ yes
+                        ▼                     ▼
+              everything else          PinchSynth: target scale ×= zoom_step
+              replayed verbatim                  │
+                                                 ▼
+                                     125 Hz worker eases current → target
+                                                 │
+                                                 ▼
+                                   virtual touchpad: 2 fingers at
+                                   ±(start_half × scale) from centre
+                                                 │
+                                                 ▼
+                              libinput → compositor → GESTURE_PINCH → Brave
 ```
 
-**Sample output**
-```
-[13941020ms][event10] SYNC  active=2  dist[0->1]=342.1
-[13941027ms][event10] SYNC  active=2  dist[0->1]=387.4
-[13941034ms][event10] GESTURE pinch-OUT (zoom-in)  |delta| > 30
-[13941037ms][event10] SYNC  active=2  dist[0->1]=431.8
-```
+**Why one continuous gesture.** Because Blink consumes scale *deltas*, a
+natural zoom needs a single long-lived gesture whose scale tracks your input.
+A burst of fixed-size gestures can only ever produce a fixed zoom quantum.
+Releasing `Alt` lifts the virtual fingers and ends the gesture.
 
-#### Tuning parameters
+**Geometry is cloned, not guessed.** libinput derives physical size from
+`range / resolution` and uses it to normalise motion and decide whether
+gestures are viable at all, so the virtual pad copies a real pad's axes via
+`EVIOCGABS`.
 
-| Constant | Default | Effect |
-|---|---|---|
-| `PINCH_DIST_THRESHOLD` $(\tau)$ | `30.0f` | Higher → less sensitive, fewer false positives |
-| `PINCH_COOLDOWN_MS` $(C)$ | `350` | Higher → slower repeat rate |
-| `PINCH_FRAMES` | `20` | More frames → smoother / slower synthetic gesture |
-| `PINCH_FRAME_MS` | `16` | Frame interval of the injected MT sequence |
-| `PINCH_START_FRAC` | `0.15` | Initial virtual finger gap as fraction of pad width |
-| `PINCH_TRAVEL_FRAC` | `0.20` | Total virtual finger travel as fraction of pad width |
-
-#### Keyboard fallback (still active)
-
-The `ShortcutEngine` lets you test pinch injection without touching the trackpad:
-
-| Shortcut | Action |
-|---|---|
-| `ALT` + `+` (or numpad `+`) | `emitPinch(+1)` — zoom in |
-| `ALT` + `-` (or numpad `-`) | `emitPinch(-1)` — zoom out |
-| `ALT` + Scroll Wheel Up | `emitPinch(+1)` — zoom in |
-| `ALT` + Scroll Wheel Down | `emitPinch(-1)` — zoom out |
-
-ALT is buffered and forwarded to the mirror device only when the next key is **not** one of the shortcuts above, so `Alt+Tab`, `Alt+F4`, and other standard combos are unaffected.
+**Travel is bounded by the pad.** Starting at a 15 mm half-gap on a 121 mm pad
+with a 5 mm edge margin, the fingers can reach ~55 mm — about **3.7× per
+gesture**. Page scale accumulates *across* gestures, so release `Alt` and
+scroll again to keep going. (An in-gesture re-grip would read as `end` +
+`begin` and visibly re-anchor the zoom, which is why it is not done.)
 
 ---
 
-### Phase 4 — Full integration on Fedora Workstation 43 *(planned)*
-
-Phase 4 will harden the Phase 3 implementation for production use on GNOME + Wayland. The key architectural shift is moving from **discrete gesture triggering** (fire once per threshold crossing) to **continuous gesture synthesis** (magnitude scaled proportionally to $|\Delta D|$), giving a far more natural feel.
-
-**Planned work**
-
-On Wayland, Mutter grabs the touchpad early. `EVIOCGRAB` from a process with the `input` group (via the udev rule below) is sufficient to intercept events before Mutter processes them; the synthetic `uinput` events then reach the compositor through the standard libinput path.
-
-Additional items:
-
-- **Systemd unit** — run PinchKey as a user service (`~/.config/systemd/user/pinchkey.service`) so it starts automatically on login without requiring `sudo`.
-- **Velocity scaling** — scale the injected pinch magnitude proportionally to $|\Delta D|$ rather than firing a fixed-size gesture, giving a more natural feel. The scaling factor $\alpha$ would be:
-
-$$
-{\text{PINCH\\_TRAVEL\\_FRAC}}_{\text{eff}} = \alpha \cdot \frac{\lvert \Delta D \rvert}{W_x}
-$$
-
-where $W_x = x_{\max} - x_{\min}$ is the full pad X-range.
-
-- **Multi-finger support** — distinguish two-finger and three-finger pinch; the mean $\bar{D}$ formula already handles $N$ fingers gracefully.
-- **libinput debug verification** — confirm with `libinput debug-events` that the virtual touchpad is classified as `TOUCHPAD` and that gestures appear as `GESTURE_PINCH_*` events.
-
----
-
-## Prerequisites
+## Install
 
 ```bash
-# Fedora
-sudo dnf install libevdev libevdev-devel gcc-c++ make
+sudo dnf install libevdev-devel gcc-c++ make     # Fedora
+sudo apt install libevdev-dev build-essential    # Debian/Ubuntu
 
-#Ubuntu
-sudo apt install libevdev-dev build-essential
-```
-
----
-
-## Build
-
-```bash
 make
 ```
 
-Compiles `PinchKey.cpp` (C++17) via `g++` with `pkg-config` for `libevdev`.
+### Permissions
+
+PinchKey needs to read `/dev/input/event*` and write `/dev/uinput`. Either run
+it with `sudo`, or install the rules once:
+
+```bash
+sudo make install-udev
+# log out and back in — group changes need a new session
+```
+
+> **Two udev rules are required.** `/dev/uinput` is `SUBSYSTEM=="misc"`, not
+> `"input"`, and ships as `0600 root:root`. A rule matching only
+> `KERNEL=="event*", SUBSYSTEM=="input"` never touches it. The rule also
+> ensures the `uinput` module is loaded at boot, since the node does not exist
+> until it is.
+
+Check your setup at any time:
+
+```bash
+make check-env
+```
+
+### Run
+
+```bash
+./pinchkey              # foreground
+./pinchkey --list       # show classified devices and their roles
+```
+
+### As a service
+
+```bash
+sudo make install
+make install-service
+systemctl --user daemon-reload
+systemctl --user enable --now pinchkey.service
+```
+
+A **user** service, bound to `graphical-session.target`: PinchKey synthesises
+input for a compositor, so it is useless before one exists and should die with
+it. It handles `SIGTERM` by lifting any virtual fingers still down, releasing
+every grab, and destroying its virtual devices, so restarts leave nothing
+behind.
 
 ---
 
-## Run
+## Configuration
 
-### Option A — sudo (quickest)
+Copy `pinchkey.conf.example` to `~/.config/pinchkey/pinchkey.conf`. Every
+tunable is runtime, not compile-time — gesture feel takes dozens of iterations
+and none of them should need a rebuild.
+
+| Key | Default | Effect |
+|---|---|---|
+| `trigger` | `alt_wheel` | `alt_wheel`, or `side_wheel` for a mouse side button |
+| `zoom_step` | `1.08` | Scale multiplier per wheel notch. Higher → coarser, faster |
+| `tick_ms` | `8` | Gesture frame interval (~125 Hz, like a real I²C pad) |
+| `ease` | `0.25` | Smoothing per tick toward target. `1.0` snaps and feels jerky |
+| `start_half_mm_in` | `15.0` | Starting half-gap when zooming in — sets the per-gesture ceiling |
+| `start_half_mm_out` | `50.0` | Starting half-gap when zooming out |
+| `edge_margin_mm` | `5.0` | Keep-out band so fingers never pin to the pad edge |
+| `min_half_mm` | `4.0` | Floor, so the two contacts never merge into one |
+| `idle_lift_ms` | `400` | Backstop lift if the modifier release is missed |
+| `grab_mouse` | `true` | Required — without it you zoom *and* scroll |
+| `grab_keyboard` | `false` | Cosmetic only; see below |
+| `monitor_touchpad` | `false` | Log pad slots/distances, read-only |
+| `log_level` | `info` | `error`, `warn`, `info`, `debug` |
+
+**On `grab_keyboard`.** Keyboards are read *passively* by default, purely to
+track whether `Alt` is held. Grabbing them would only hide the bare `Alt`
+press from the compositor — which is cosmetic, since a held `Alt` does nothing
+in GNOME on its own — and it is not worth putting PinchKey in the path of all
+your typing, plus a mirror device per keyboard.
+
+The mouse *is* grabbed, because the wheel has to be swallowed. Everything
+PinchKey does not consume is replayed through a mirror device that clones the
+original's capabilities, so acceleration and button mapping are unchanged.
+
+---
+
+## Verifying it works
+
+Before debugging the daemon, confirm the compositor path end to end with the
+standalone probe. It creates a virtual pad, sends **one** continuous pinch, and
+grabs nothing:
 
 ```bash
-sudo ./PinchKey
+make probe
+sudo ./pinchprobe out 2.0 600     # direction, scale, duration-ms
 ```
 
-### Option B — no sudo (permanent, recommended)
+Park the mouse over something in Brave during the 4-second countdown. If the
+page zooms at the cursor, the mechanism is sound and any remaining problem is
+in the daemon.
+
+To watch what libinput makes of the virtual device:
 
 ```bash
-make install-udev
-# Log out and back in, or: newgrp input
-./PinchKey
+sudo libinput debug-events | grep -i -e pinch -e PinchKey
 ```
 
-The udev rule grants the `input` group read/write access to all `/dev/input/event*` nodes and `/dev/uinput`.
+You want the device classified as `TOUCHPAD` and `GESTURE_PINCH_BEGIN` /
+`_UPDATE` / `_END` events.
 
 ---
 
 ## Troubleshooting
 
-| Problem | Fix |
+| Problem | Cause / fix |
 |---|---|
-| `Permission denied` on `/dev/input/eventN` | `sudo ./PinchKey` or `make install-udev` |
-| `Cannot open /dev/uinput` | Same — needs `sudo` or `input` group |
-| `pkg-config: libevdev not found` | `sudo dnf install libevdev-devel` |
-| No devices attached | `ls -l /dev/input/event*` and check group membership |
-| Distances always zero | Two fingers must be down simultaneously |
-| Gesture fires but app ignores it | `libinput debug-events` — check device is classified as `TOUCHPAD` |
-| Too many spurious zooms | Raise `PINCH_DIST_THRESHOLD` |
-| Gesture feels sluggish / unresponsive | Lower `PINCH_DIST_THRESHOLD` or `PINCH_COOLDOWN_MS` |
-| GNOME grabs trackpad (Wayland) | Run from a TTY or use `sudo` |
+| `Cannot open /dev/uinput` | `sudo make install-udev`, then start a new session |
+| `No real touchpad found` | PinchKey needs one as a geometry template. On a desktop, see the note below |
+| Zoom *and* scroll both happen | The mouse was not grabbed — check `grab_mouse` and for another process holding `EVIOCGRAB` |
+| Nothing happens, no errors | Run the probe above. If the probe works and the daemon does not, the wheel device is not being grabbed — check `./pinchkey --list` |
+| Zoom is jerky / steppy | Lower `zoom_step`, or lower `ease` for a longer glide |
+| Zoom stops partway | Per-gesture travel limit. Release `Alt` and scroll again; or raise the ceiling by lowering `start_half_mm_in` |
+| Alt+Tab stopped working | Only possible with `grab_keyboard = true`; set it back to `false` |
+| GNOME shows a second touchpad in Settings | Expected — that is the virtual pad |
+
+**Desktops with no touchpad** currently cannot run the daemon, because it
+clones geometry from a real pad. Synthesising plausible geometry instead is a
+known gap (see below).
 
 ---
 
-## File overview
+## Project layout
 
-| File | Purpose |
-|---|---|
-| `PinchKey_phase1.cpp` | Phase 1 |
-| `PinchKey_phase2.cpp` | Phase 2 |
-| `PinchKey_phase3.cpp` | Phase 3 (active) |
-| `Makefile` | Build + udev-rule installation |
+```
+src/
+  main.cpp           CLI, device scan, wiring, clean shutdown
+  config.{h,cpp}     runtime configuration
+  uinput_pad.{h,cpp} geometry probe + virtual touchpad, MT Protocol B frames
+  pinch_synth.{h,cpp}continuous gesture state machine (the core)
+  input_router.{h,cpp} per-device loop: passive modifier tracking or grab+mirror
+  mirror.{h,cpp}     uinput clone of a grabbed device
+  modifiers.{h,cpp}  process-global trigger state
+  evdev_device.{h,cpp} RAII libevdev wrapper, device classification
+  touch_monitor.{h,cpp} read-only pad diagnostics
+tests/test_logic.cpp config parsing, distance maths, modifier counting
+tools/pinchprobe.cpp standalone feasibility probe
+packaging/           udev rules, modules-load, systemd unit
+```
+
+```bash
+make        # build
+make test   # logic tests (no kernel devices needed)
+make probe  # standalone probe
+```
 
 ---
 
-## Phase Summary
+## Known gaps
 
-- **Phase 1** is the **core phase**, where raw finger positions are detected and tracked from the touchpad.
-- **Phase 2** builds on Phase 1 by computing distances between fingers using the Euclidean distance formula.
-- **Phase 3** extends both Phase 1 and Phase 2 by adding gesture recognition along with a keyboard shortcut fallback for triggering pinch actions.
+- **No hotplug.** Devices are scanned once at startup, so a mouse unplugged
+  and replugged stops working until restart. A service starting at boot may
+  also race USB enumeration. Needs a udev monitor.
+- **Requires a real touchpad** as a geometry template; desktops are unsupported.
+- **Per-gesture zoom ceiling** set by pad geometry, as described above.
+- **`side_wheel` trigger is parsed but untested.**
+- Verified only on GNOME 50 / Wayland / Fedora 44. X11 delivers pinch through
+  XI 2.4 and is untested.
+
+## History
+
+Originally a four-phase trackpad experiment: finger tracking → inter-finger
+distances → gesture recognition → integration, as three near-identical
+single-file prototypes. Those are preserved in git history at commit
+`b35070a`. The restructure here fixed several things worth naming:
+
+- Modifier state was per-device, so `Alt` (keyboard) and the wheel (mouse)
+  never met and `Alt`+wheel could not fire.
+- The real touchpad was grabbed but never mirrored, leaving it completely dead
+  while PinchKey ran.
+- The virtual pad's fallback geometry described a 38 × 29 mm pad, reachable
+  through a startup race.
+- `INPUT_PROP_BUTTONPAD` was declared without `BTN_LEFT`.
+- The documented no-sudo path could not work, as the udev rule never matched
+  `/dev/uinput`.
