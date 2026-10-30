@@ -1,0 +1,50 @@
+[Unit]
+Description=PinchKey — mouse-driven native pinch zoom
+Documentation=https://github.com/ASPRNG-PRGMR/PinchKey
+
+# Bind to the graphical session: PinchKey synthesises input for the
+# compositor, so it is useless before one exists and should go away with it.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+# Give up if it fails immediately and repeatedly. A restart loop that keeps
+# grabbing and releasing the mouse makes the desktop unusable, which is far
+# worse than the feature simply being off.
+# These belong in [Unit], not [Service] — systemd ignores them there.
+StartLimitIntervalSec=30
+StartLimitBurst=4
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pinchkey
+
+Restart=on-failure
+RestartSec=2
+
+# SIGTERM is handled: the daemon lifts any virtual fingers still down,
+# releases every EVIOCGRAB, and destroys its uinput devices before exiting.
+# KillMode=mixed with a real timeout gives it the chance to do that. A
+# SIGKILL here would leave stale virtual devices behind.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=5
+
+# Hardening. PinchKey needs /dev/input and /dev/uinput and nothing else.
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectHome=read-only
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+NoNewPrivileges=yes
+SystemCallArchitectures=native
+DeviceAllow=/dev/uinput rw
+DeviceAllow=char-input rw
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,13 @@
+# PinchKey device access.
+#
+# Two rules are needed, and the second is the one that is easy to miss:
+#
+#   1. /dev/input/event*  — SUBSYSTEM=="input"  — to read real devices
+#   2. /dev/uinput        — SUBSYSTEM=="misc"   — to create virtual ones
+#
+# A rule matching only KERNEL=="event*", SUBSYSTEM=="input" never touches
+# /dev/uinput, which ships as 0600 root:root. Without rule 2 the daemon
+# cannot create its virtual touchpad except as root.
+
+KERNEL=="event*", SUBSYSTEM=="input", GROUP="input", MODE="0660"
+KERNEL=="uinput", SUBSYSTEM=="misc",  GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"
